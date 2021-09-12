@@ -20,7 +20,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.data.dataset import Dataset, IterableDataset
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data.sampler import Sampler
+from torch.utils.data.sampler import Sampler, SequentialSampler
 
 from pytorch_lightning import Trainer
 from pytorch_lightning.trainer.supporters import (
@@ -29,7 +29,6 @@ from pytorch_lightning.trainer.supporters import (
     CombinedLoader,
     CombinedLoaderIterator,
     CycleIterator,
-    prefetch_iterator,
     TensorRunningAccum,
 )
 from pytorch_lightning.utilities.apply_func import apply_to_collection
@@ -37,7 +36,7 @@ from pytorch_lightning.utilities.exceptions import MisconfigurationException
 
 
 def test_tensor_running_accum_reset():
-    """Test that reset would set all attributes to the initialization state"""
+    """Test that reset would set all attributes to the initialization state."""
 
     window_length = 10
 
@@ -59,6 +58,7 @@ def test_tensor_running_accum_reset():
 
 def test_cycle_iterator():
     """Test the cycling function of `CycleIterator`"""
+
     iterator = CycleIterator(range(100), 1000)
     assert len(iterator) == 1000
     for idx, item in enumerate(iterator):
@@ -79,28 +79,6 @@ def test_none_length_cycle_iterator():
     assert item == 0
 
 
-def test_prefetch_iterator():
-    """Test the prefetch_iterator with PyTorch IterableDataset."""
-
-    class IterDataset(IterableDataset):
-        def __iter__(self):
-            yield 1
-            yield 2
-            yield 3
-
-    dataset = IterDataset()
-    iterator = prefetch_iterator(dataset)
-    assert list(iterator) == [(1, False), (2, False), (3, True)]
-
-    class EmptyIterDataset(IterableDataset):
-        def __iter__(self):
-            return iter([])
-
-    dataset = EmptyIterDataset()
-    iterator = prefetch_iterator(dataset)
-    assert list(iterator) == []
-
-
 @pytest.mark.parametrize(
     ["dataset_1", "dataset_2"],
     [
@@ -111,7 +89,7 @@ def test_prefetch_iterator():
     ],
 )
 def test_combined_dataset(dataset_1, dataset_2):
-    """Verify the length of the CombinedDataset"""
+    """Verify the length of the CombinedDataset."""
     datasets = [dataset_1, dataset_2]
     combined_dataset = CombinedDataset(datasets)
 
@@ -126,7 +104,7 @@ def test_combined_dataset_length_mode_error():
 
 
 def test_combined_loader_iterator_dict_min_size():
-    """Test `CombinedLoaderIterator` given mapping loaders"""
+    """Test `CombinedLoaderIterator` given mapping loaders."""
     loaders = {
         "a": torch.utils.data.DataLoader(range(10), batch_size=4),
         "b": torch.utils.data.DataLoader(range(20), batch_size=5),
@@ -149,19 +127,19 @@ def test_combined_loader_init_mode_error():
 
 
 def test_combined_loader_loader_type_error():
-    """Test the ValueError when wrapping the loaders"""
+    """Test the ValueError when wrapping the loaders."""
     with pytest.raises(TypeError, match="Expected data to be int, Sequence or Mapping, but got NoneType"):
         CombinedLoader(None, "max_size_cycle")
 
 
 def test_combined_loader_calc_length_mode_error():
-    """Test the ValueError when calculating the number of batches"""
+    """Test the ValueError when calculating the number of batches."""
     with pytest.raises(TypeError, match="Expected data to be int, Sequence or Mapping, but got NoneType"):
         CombinedLoader._calc_num_batches(None)
 
 
 def test_combined_loader_dict_min_size():
-    """Test `CombinedLoader` of mode 'min_size' given mapping loaders"""
+    """Test `CombinedLoader` of mode 'min_size' given mapping loaders."""
     loaders = {
         "a": torch.utils.data.DataLoader(range(10), batch_size=4),
         "b": torch.utils.data.DataLoader(range(20), batch_size=5),
@@ -180,7 +158,7 @@ def test_combined_loader_dict_min_size():
 
 
 def test_combined_loader_dict_max_size_cycle():
-    """Test `CombinedLoader` of mode 'max_size_cycle' given mapping loaders"""
+    """Test `CombinedLoader` of mode 'max_size_cycle' given mapping loaders."""
     loaders = {
         "a": torch.utils.data.DataLoader(range(10), batch_size=4),
         "b": torch.utils.data.DataLoader(range(20), batch_size=5),
@@ -199,7 +177,7 @@ def test_combined_loader_dict_max_size_cycle():
 
 
 def test_combined_loader_sequence_min_size():
-    """Test `CombinedLoader` of mode 'min_size' given sequence loaders"""
+    """Test `CombinedLoader` of mode 'min_size' given sequence loaders."""
     loaders = [
         torch.utils.data.DataLoader(range(10), batch_size=4),
         torch.utils.data.DataLoader(range(20), batch_size=5),
@@ -216,8 +194,85 @@ def test_combined_loader_sequence_min_size():
     assert idx == len(combined_loader) - 1
 
 
+class TestIterableDataset(IterableDataset):
+    def __init__(self, size: int = 10):
+        self.size = size
+
+    def __iter__(self):
+        self.sampler = SequentialSampler(range(self.size))
+        self.sampler_iter = iter(self.sampler)
+        return self
+
+    def __next__(self):
+        return next(self.sampler_iter)
+
+
+@pytest.mark.parametrize("mode", ["min_size", "max_size_cycle"])
+@pytest.mark.parametrize("use_multiple_dataloaders", [False, True])
+def test_combined_loader_sequence_iterable_dataset(mode, use_multiple_dataloaders):
+    """Test `CombinedLoader` of mode 'min_size' given sequence loaders."""
+    if use_multiple_dataloaders:
+        loaders = [
+            torch.utils.data.DataLoader(TestIterableDataset(10), batch_size=2),
+            torch.utils.data.DataLoader(TestIterableDataset(20), batch_size=2),
+        ]
+    else:
+        loaders = [
+            torch.utils.data.DataLoader(TestIterableDataset(10), batch_size=2),
+        ]
+
+    combined_loader = CombinedLoader(loaders, mode)
+
+    has_break = False
+
+    for idx, item in enumerate(combined_loader):
+        assert isinstance(item, Sequence)
+        assert len(item) == 2 if use_multiple_dataloaders else 1
+        if not use_multiple_dataloaders and idx == 4:
+            has_break = True
+            break
+
+    if mode == "max_size_cycle":
+        assert combined_loader.loaders[0].state.done == (not has_break)
+    expected = (10 if mode == "max_size_cycle" else 5) if use_multiple_dataloaders else 5
+    assert (expected - 1) == idx, (mode, use_multiple_dataloaders)
+
+
+@pytest.mark.parametrize("lengths", [[4, 6], [5, 5], [6, 4]])
+def test_combined_loader_sequence_with_map_and_iterable(lengths):
+    class MyIterableDataset(IterableDataset):
+        def __init__(self, size: int = 10):
+            self.size = size
+
+        def __iter__(self):
+            self.sampler = SequentialSampler(range(self.size))
+            self.iter_sampler = iter(self.sampler)
+            return self
+
+        def __next__(self):
+            return next(self.iter_sampler)
+
+    class MyMapDataset(Dataset):
+        def __init__(self, size: int = 10):
+            self.size = size
+
+        def __getitem__(self, index):
+            return index
+
+        def __len__(self):
+            return self.size
+
+    x, y = lengths
+    loaders = [DataLoader(MyIterableDataset(x)), DataLoader(MyMapDataset(y))]
+    dataloader = CombinedLoader(loaders, mode="max_size_cycle")
+    counter = 0
+    for _ in dataloader:
+        counter += 1
+    assert counter == max(x, y)
+
+
 def test_combined_loader_sequence_max_size_cycle():
-    """Test `CombinedLoader` of mode 'max_size_cycle' given sequence loaders"""
+    """Test `CombinedLoader` of mode 'max_size_cycle' given sequence loaders."""
     loaders = [
         torch.utils.data.DataLoader(range(10), batch_size=4),
         torch.utils.data.DataLoader(range(20), batch_size=5),
@@ -257,10 +312,8 @@ def test_nested_calc_num_data(input_data, compute_func, expected_length):
 @mock.patch("torch.cuda.device_count", return_value=2)
 @mock.patch("torch.cuda.is_available", return_value=True)
 def test_combined_data_loader_validation_test(cuda_available_mock, device_count_mock, tmpdir):
-    """
-    This test makes sure distributed sampler has been properly injected in dataloaders
-    when using CombinedLoader
-    """
+    """This test makes sure distributed sampler has been properly injected in dataloaders when using
+    CombinedLoader."""
 
     class CustomDataset(Dataset):
         def __init__(self, data):

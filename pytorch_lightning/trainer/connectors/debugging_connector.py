@@ -35,8 +35,7 @@ class DebuggingConnector:
     ):
         if not isinstance(fast_dev_run, (bool, int)):
             raise MisconfigurationException(
-                f"fast_dev_run={fast_dev_run} is not a valid configuration."
-                " It should be either a bool or an int >= 0"
+                f"fast_dev_run={fast_dev_run} is not a valid configuration. It should be either a bool or an int >= 0"
             )
 
         if isinstance(fast_dev_run, int) and (fast_dev_run < 0):
@@ -77,7 +76,7 @@ class DebuggingConnector:
         self.determine_data_use_amount(self.trainer.overfit_batches)
 
     def determine_data_use_amount(self, overfit_batches: float) -> None:
-        """Use less data for debugging purposes"""
+        """Use less data for debugging purposes."""
         if overfit_batches > 0:
             self.trainer.limit_train_batches = overfit_batches
             self.trainer.limit_val_batches = overfit_batches

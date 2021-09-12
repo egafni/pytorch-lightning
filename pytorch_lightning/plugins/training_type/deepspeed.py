@@ -27,6 +27,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import GradientAccumulationScheduler
 from pytorch_lightning.overrides.base import _LightningModuleWrapperBase
 from pytorch_lightning.plugins.environments.cluster_environment import ClusterEnvironment
+from pytorch_lightning.plugins.io.checkpoint_plugin import CheckpointIO
 from pytorch_lightning.plugins.training_type.ddp import DDPPlugin
 from pytorch_lightning.trainer.optimizers import _get_default_scheduler_config
 from pytorch_lightning.trainer.states import TrainerFn
@@ -36,7 +37,7 @@ from pytorch_lightning.utilities.distributed import log, rank_zero_info, rank_ze
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
 from pytorch_lightning.utilities.imports import _DEEPSPEED_AVAILABLE
 from pytorch_lightning.utilities.types import LRSchedulerTypeTuple
-from pytorch_lightning.utilities.warnings import _warn, LightningDeprecationWarning, rank_zero_warn, WarningCache
+from pytorch_lightning.utilities.warnings import rank_zero_warn, WarningCache
 
 warning_cache = WarningCache()
 
@@ -123,14 +124,10 @@ class DeepSpeedPlugin(DDPPlugin):
         contiguous_memory_optimization: bool = False,
         synchronize_checkpoint_boundary: bool = False,
         load_full_weights: bool = False,
-        cpu_offload: bool = False,
-        cpu_offload_params: bool = False,
-        cpu_offload_use_pin_memory: bool = False,
     ) -> None:
-        """
-        Provides capabilities to run training using the DeepSpeed library,
-        with training optimizations for large billion parameter models.
-        `For more information: https://pytorch-lightning.readthedocs.io/en/latest/advanced/multi_gpu.html#deepspeed`.
+        """Provides capabilities to run training using the DeepSpeed library, with training optimizations for large
+        billion parameter models. `For more information: https://pytorch-
+        lightning.readthedocs.io/en/latest/advanced/multi_gpu.html#deepspeed`.
 
         .. warning:: ``DeepSpeedPlugin`` is in beta and subject to change.
 
@@ -262,20 +259,12 @@ class DeepSpeedPlugin(DDPPlugin):
                 "To use the DeepSpeed plugin, you must have DeepSpeed installed. pip install deepspeed"
             )
 
-        if cpu_offload or cpu_offload_params or cpu_offload_use_pin_memory:
-            _warn(
-                "The usage of `cpu_offload`, `cpu_offload_params`, and `cpu_offload_use_pin_memory` "
-                "is deprecated since v1.4 and will be removed in v1.5."
-                " From now on use `offload_optimizer`, `offload_parameters` and `pin_memory`.",
-                category=LightningDeprecationWarning,
-            )
-            offload_optimizer = cpu_offload
-            offload_parameters = cpu_offload_params
-            pin_memory = cpu_offload_use_pin_memory
-
         super().__init__(
-            parallel_devices=parallel_devices, num_nodes=num_nodes, cluster_environment=cluster_environment
+            parallel_devices=parallel_devices,
+            num_nodes=num_nodes,
+            cluster_environment=cluster_environment,
         )
+
         self.config = self._load_config(config)
         if self.config is None:
             # User has not overridden config, set defaults
@@ -350,7 +339,7 @@ class DeepSpeedPlugin(DDPPlugin):
             world_size = world_size if world_size is not None else self.cluster_environment.world_size()
             self._set_node_environment_variables(global_rank, world_size)
             log.info(
-                f"initializing deepspeed distributed: "
+                "initializing deepspeed distributed: "
                 f"GLOBAL_RANK: {global_rank}, "
                 f"MEMBER: {global_rank + 1}/{world_size}"
             )
@@ -529,11 +518,10 @@ class DeepSpeedPlugin(DDPPlugin):
         self.model.step(**kwargs)
 
     def _handle_gradient_accumulation_steps(self):
-        """
-        This functions overrides the trainer.accumulation_scheduler to generate
-        ``accumulate_grad_batches=1``.
-        Therefore, ``optimizer_step`` will be called on every batches seen
-        so DeepSpeed Engine handles the gradient accumulation logic internally.
+        """This functions overrides the trainer.accumulation_scheduler to generate ``accumulate_grad_batches=1``.
+
+        Therefore, ``optimizer_step`` will be called on every batches seen so DeepSpeed Engine handles the gradient
+        accumulation logic internally.
         """
         if self.config.get("gradient_accumulation_steps") > 1:
             self._original_accumulate_grad_batches = self.lightning_module.trainer.accumulate_grad_batches
@@ -558,6 +546,11 @@ class DeepSpeedPlugin(DDPPlugin):
                 " as this will be set via accumulate_grad_batches=x argument passed via the Lightning Trainer."
             )
         if "train_micro_batch_size_per_gpu" not in self.config:
+            rank_zero_warn(
+                "Inferring the batch size for internal deepspeed logging from the `train_dataloader()`. "
+                "If you require skipping this, please pass "
+                "`Trainer(plugins=DeepSpeedPlugin(logging_batch_size_per_gpu=batch_size))`"
+            )
             batch_size = self._auto_select_batch_size()
             self.config["train_micro_batch_size_per_gpu"] = batch_size
         self.config["gradient_accumulation_steps"] = self.lightning_module.trainer.accumulate_grad_batches
@@ -692,12 +685,12 @@ class DeepSpeedPlugin(DDPPlugin):
         checkpoint = {k: v for k, v in checkpoint.items() if k not in _exclude_keys}
         self.deepspeed_engine.save_checkpoint(filepath, client_state=checkpoint)
 
-    def load_checkpoint_file(self, checkpoint_path: Union[str, Path]) -> Optional[Dict[str, Any]]:
+    def load_checkpoint(self, checkpoint_path: Union[str, Path]) -> Optional[Dict[str, Any]]:
         if self.load_full_weights and self.zero_stage_3:
             # Broadcast to ensure we load from the rank 0 checkpoint
             # This doesn't have to be the case when using deepspeed sharded checkpointing
             checkpoint_path = self.broadcast(checkpoint_path)
-            return super().load_checkpoint_file(checkpoint_path)
+            return super().load_checkpoint(checkpoint_path)
 
         # Rely on deepspeed to load the checkpoint and necessary information
         from pytorch_lightning.trainer.states import TrainerFn
@@ -725,17 +718,15 @@ class DeepSpeedPlugin(DDPPlugin):
         return False
 
     def load_model_state_dict(self, checkpoint: Mapping[str, Any]) -> None:
-        # override to do nothing, deepspeed engine already loaded the weights in `load_checkpoint_file()`
+        # override to do nothing, deepspeed engine already loaded the weights in `load_checkpoint()`
         if self.load_full_weights and self.zero_stage_3:
             self.model_to_device()
             self._restore_zero_state(checkpoint)
 
     def _restore_zero_state(self, ckpt: Mapping[str, Any]) -> None:
-        """
-        Overrides the normal load_state_dict behaviour in PyTorch to ensure
-        we gather parameters that may be sharded across processes before loading
-        the state dictionary when using ZeRO stage 3.
-        This is then automatically synced across processes.
+        """Overrides the normal load_state_dict behaviour in PyTorch to ensure we gather parameters that may be
+        sharded across processes before loading the state dictionary when using ZeRO stage 3. This is then
+        automatically synced across processes.
 
         Args:
             ckpt: The ckpt file.
@@ -777,7 +768,7 @@ class DeepSpeedPlugin(DDPPlugin):
         load(self.lightning_module, prefix="")
 
     def load_optimizer_state_dict(self, checkpoint: Mapping[str, Any]) -> None:
-        # override to do nothing, deepspeed engine already loaded the states in `load_checkpoint_file()`
+        # override to do nothing, deepspeed engine already loaded the states in `load_checkpoint()`
         pass
 
     def update_global_step(self, total_batch_idx: int, current_global_step: int) -> int:
@@ -790,6 +781,7 @@ class DeepSpeedPlugin(DDPPlugin):
     @classmethod
     def register_plugins(cls, plugin_registry: Dict) -> None:
         plugin_registry.register("deepspeed", cls, description="Default DeepSpeed Plugin")
+        plugin_registry.register("deepspeed_stage_1", cls, description="DeepSpeed with ZeRO Stage 1 enabled", stage=1)
         plugin_registry.register("deepspeed_stage_2", cls, description="DeepSpeed with ZeRO Stage 2 enabled", stage=2)
         plugin_registry.register(
             "deepspeed_stage_2_offload",
@@ -818,3 +810,20 @@ class DeepSpeedPlugin(DDPPlugin):
             offload_params_device="nvme",
             offload_optimizer_device="nvme",
         )
+
+    @property
+    def checkpoint_io(self) -> CheckpointIO:
+        return self._checkpoint_io
+
+    @checkpoint_io.setter
+    def checkpoint_io(self, plugin: CheckpointIO) -> None:
+        raise MisconfigurationException("DeepSpeed currently does not support custom checkpoint plugins.")
+
+    def validation_step(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+    def test_step(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+    def predict_step(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
