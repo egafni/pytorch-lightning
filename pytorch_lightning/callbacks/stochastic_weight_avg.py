@@ -166,25 +166,18 @@ class StochasticWeightAveraging(Callback):
             # move average model to request device.
             self._average_model = self._average_model.to(self._device or pl_module.device)
 
-            optimizers = trainer.optimizers
+            optimizer = trainer.optimizers[0]
+            if self._swa_lrs is None:
+                self._swa_lrs = [param_group["lr"] for param_group in optimizer.param_groups]
+            if isinstance(self._swa_lrs, float):
+                self._swa_lrs = [self._swa_lrs] * len(optimizer.param_groups)
 
-            for param_group in optimizers[0].param_groups:
-                if self._swa_lrs is None:
-                    initial_lr = param_group["lr"]
-
-                elif isinstance(self._swa_lrs, float):
-                    initial_lr = self._swa_lrs
-
-                else:
-                    initial_lr = self._swa_lrs[0]
-
-                param_group["initial_lr"] = initial_lr
-
-            self._swa_lrs = initial_lr
+            for lr, group in zip(self._swa_lrs, optimizer.param_groups):
+                group["initial_lr"] = lr
 
             self._swa_scheduler = SWALR(
-                optimizers[0],
-                swa_lr=initial_lr,
+                optimizer,
+                swa_lr=self._swa_lrs,
                 anneal_epochs=self._annealing_epochs,
                 anneal_strategy=self._annealing_strategy,
                 last_epoch=trainer.max_epochs if self._annealing_strategy == "cos" else -1,
@@ -248,9 +241,7 @@ class StochasticWeightAveraging(Callback):
             dst_param.detach().copy_(src_param.to(dst_param.device))
 
     def reset_batch_norm_and_save_state(self, pl_module: "pl.LightningModule"):
-        """
-        Adapted from https://github.com/pytorch/pytorch/blob/v1.7.1/torch/optim/swa_utils.py#L140-L154
-        """
+        """Adapted from https://github.com/pytorch/pytorch/blob/v1.7.1/torch/optim/swa_utils.py#L140-L154."""
         self.momenta = {}
         for module in pl_module.modules():
             if not isinstance(module, nn.modules.batchnorm._BatchNorm):
@@ -266,9 +257,7 @@ class StochasticWeightAveraging(Callback):
             module.num_batches_tracked *= 0
 
     def reset_momenta(self):
-        """
-        Adapted from https://github.com/pytorch/pytorch/blob/v1.7.1/torch/optim/swa_utils.py#L164-L165
-        """
+        """Adapted from https://github.com/pytorch/pytorch/blob/v1.7.1/torch/optim/swa_utils.py#L164-L165."""
         for bn_module in self.momenta:
             bn_module.momentum = self.momenta[bn_module]
 
@@ -276,9 +265,7 @@ class StochasticWeightAveraging(Callback):
     def update_parameters(
         average_model: "pl.LightningModule", model: "pl.LightningModule", n_averaged: torch.LongTensor, avg_fn: _AVG_FN
     ):
-        """
-        Adapted from https://github.com/pytorch/pytorch/blob/v1.7.1/torch/optim/swa_utils.py#L104-L112
-        """
+        """Adapted from https://github.com/pytorch/pytorch/blob/v1.7.1/torch/optim/swa_utils.py#L104-L112."""
         for p_swa, p_model in zip(average_model.parameters(), model.parameters()):
             device = p_swa.device
             p_swa_ = p_swa.detach()
@@ -291,7 +278,5 @@ class StochasticWeightAveraging(Callback):
     def avg_fn(
         averaged_model_parameter: torch.Tensor, model_parameter: torch.Tensor, num_averaged: torch.LongTensor
     ) -> torch.FloatTensor:
-        """
-        Adapted from https://github.com/pytorch/pytorch/blob/v1.7.1/torch/optim/swa_utils.py#L95-L97
-        """
+        """Adapted from https://github.com/pytorch/pytorch/blob/v1.7.1/torch/optim/swa_utils.py#L95-L97."""
         return averaged_model_parameter + (model_parameter - averaged_model_parameter) / (num_averaged + 1)
